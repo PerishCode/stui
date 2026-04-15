@@ -18,6 +18,7 @@ const REQUEST_TIMEOUT_MS: u64 = 5_000;
 const STOP_TIMEOUT_MS: u64 = 5_000;
 const POLL_INTERVAL_MS: u64 = 100;
 const START_ATTEMPTS: usize = 2;
+const READY_MARKER_PREFIX: &str = "status=ready playground=";
 
 #[derive(Debug, Parser)]
 #[command(name = "stui-dev")]
@@ -55,6 +56,8 @@ struct StartArgs {
     playground: PlaygroundName,
     #[arg(long, default_value = "default")]
     instance: String,
+    #[arg(long, default_value_t = false)]
+    build: bool,
     #[arg(long, value_enum)]
     behavior: Option<BehaviorArg>,
 }
@@ -168,12 +171,6 @@ fn prune_action() -> Result<()> {
 fn start_target(args: StartArgs) -> Result<()> {
     let namespace_prefix = dev_namespace_prefix();
 
-    println!(
-        "stage=build playground={} instance={}",
-        args.playground.as_str(),
-        args.instance
-    );
-
     if let Some(existing) = read_state(args.playground, &args.instance)? {
         if request_inspect(&existing).is_ok() {
             bail!(
@@ -187,7 +184,15 @@ fn start_target(args: StartArgs) -> Result<()> {
     }
 
     ensure_runtime_dirs()?;
-    build_playground(args.playground)?;
+
+    if args.build {
+        println!(
+            "stage=build playground={} instance={}",
+            args.playground.as_str(),
+            args.instance
+        );
+        build_playground(args.playground)?;
+    }
 
     let binary_path = playground_binary_path(args.playground);
 
@@ -461,17 +466,41 @@ fn wait_for_readiness(state: &StateRecord) -> Result<()> {
     let deadline = Instant::now() + Duration::from_millis(START_TIMEOUT_MS);
 
     loop {
-        match request_inspect(state) {
-            Ok(_) => return Ok(()),
-            Err(error) => {
-                if Instant::now() >= deadline {
-                    return Err(error).context("timed out waiting for playground readiness");
-                }
-            }
+        if log_reports_ready(state)? {
+            return Ok(());
+        }
+
+        if !process_exists(state.pid).unwrap_or(false) {
+            bail!(
+                "playground process exited before readiness: {} {}",
+                state.playground.as_str(),
+                state.instance
+            );
+        }
+
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for playground readiness");
         }
 
         thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
     }
+}
+
+fn log_reports_ready(state: &StateRecord) -> Result<bool> {
+    let contents = match fs::read_to_string(&state.log_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read readiness log {}", state.log_path.display()))
+        }
+    };
+
+    Ok(contents.lines().any(|line| {
+        line.starts_with(READY_MARKER_PREFIX)
+            && line.contains(&format!("playground={}", state.playground.as_str()))
+            && line.contains(&format!("instance={}", state.instance))
+    }))
 }
 
 fn wait_for_shutdown(state: &StateRecord) -> Result<()> {
@@ -844,11 +873,78 @@ fn target_debug_dir() -> PathBuf {
 }
 
 fn playground_binary_path(playground: PlaygroundName) -> PathBuf {
+    let repo_binary = repo_debug_binary_path(playground);
+    let current_exe = env::current_exe().ok();
+    let env_override = env::var_os(playground.binary_override_env())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let sibling_binary = current_exe
+        .as_ref()
+        .and_then(|path| sibling_binary_path(path, playground));
+    let path_binary = find_binary_on_path(playground.binary_name());
+    let prefer_repo_debug = current_exe
+        .as_ref()
+        .is_some_and(|path| is_repo_target_binary(path));
+
+    let mut candidates = Vec::new();
+    if let Some(path) = env_override {
+        candidates.push(path);
+    }
+
+    if prefer_repo_debug {
+        candidates.push(repo_binary.clone());
+        if let Some(path) = sibling_binary {
+            candidates.push(path);
+        }
+        if let Some(path) = path_binary {
+            candidates.push(path);
+        }
+    } else {
+        if let Some(path) = sibling_binary {
+            candidates.push(path);
+        }
+        if let Some(path) = path_binary {
+            candidates.push(path);
+        }
+        candidates.push(repo_binary.clone());
+    }
+
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .unwrap_or(repo_binary)
+}
+
+fn repo_debug_binary_path(playground: PlaygroundName) -> PathBuf {
     target_debug_dir().join(format!(
         "{}{}",
         playground.binary_name(),
         env::consts::EXE_SUFFIX
     ))
+}
+
+fn sibling_binary_path(current_exe: &Path, playground: PlaygroundName) -> Option<PathBuf> {
+    current_exe.parent().map(|dir| {
+        dir.join(format!(
+            "{}{}",
+            playground.binary_name(),
+            env::consts::EXE_SUFFIX
+        ))
+    })
+}
+
+fn find_binary_on_path(binary_name: &str) -> Option<PathBuf> {
+    let executable = format!("{}{}", binary_name, env::consts::EXE_SUFFIX);
+    let path = env::var_os("PATH")?;
+
+    env::split_paths(&path)
+        .map(|dir| dir.join(&executable))
+        .find(|candidate| candidate.is_file())
+}
+
+fn is_repo_target_binary(path: &Path) -> bool {
+    path.starts_with(repo_root().join("target"))
 }
 
 fn dev_runtime_root() -> PathBuf {
@@ -968,6 +1064,12 @@ impl PlaygroundName {
         }
     }
 
+    fn binary_override_env(self) -> &'static str {
+        match self {
+            Self::BlackBox => "STUI_DEV_BLACK_BOX_BIN",
+        }
+    }
+
     fn from_str(value: &str) -> Result<Self> {
         match value {
             "black-box" => Ok(Self::BlackBox),
@@ -993,5 +1095,114 @@ impl RuntimeStatus {
             Self::Stopped => "stopped",
             Self::Stale => "stale",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn choose_candidate(
+        repo_binary: &Path,
+        current_exe: Option<&Path>,
+        env_override: Option<&Path>,
+        path_binary: Option<&Path>,
+    ) -> Vec<PathBuf> {
+        let sibling_binary =
+            current_exe.and_then(|path| sibling_binary_path(path, PlaygroundName::BlackBox));
+        let prefer_repo_debug = current_exe.is_some_and(is_repo_target_binary);
+        let mut candidates = Vec::new();
+
+        if let Some(path) = env_override {
+            candidates.push(path.to_path_buf());
+        }
+
+        if prefer_repo_debug {
+            candidates.push(repo_binary.to_path_buf());
+            if let Some(path) = sibling_binary {
+                candidates.push(path);
+            }
+            if let Some(path) = path_binary {
+                candidates.push(path.to_path_buf());
+            }
+        } else {
+            if let Some(path) = sibling_binary {
+                candidates.push(path);
+            }
+            if let Some(path) = path_binary {
+                candidates.push(path.to_path_buf());
+            }
+            candidates.push(repo_binary.to_path_buf());
+        }
+
+        candidates.dedup();
+        candidates
+    }
+
+    #[test]
+    fn dev_path_prefers_repo_debug_binary() {
+        let repo_binary = repo_root().join("target").join("debug").join(format!(
+            "stui-playground-black-box{}",
+            env::consts::EXE_SUFFIX
+        ));
+        let current_exe = repo_root()
+            .join("target")
+            .join("debug")
+            .join(format!("stui-dev{}", env::consts::EXE_SUFFIX));
+        let path_binary = PathBuf::from(format!(
+            r"C:\Users\Nexu\.cargo\bin\stui-playground-black-box{}",
+            env::consts::EXE_SUFFIX
+        ));
+
+        let candidates =
+            choose_candidate(&repo_binary, Some(&current_exe), None, Some(&path_binary));
+
+        assert_eq!(candidates.first(), Some(&repo_binary));
+    }
+
+    #[test]
+    fn installed_path_prefers_sibling_or_path_before_repo_debug() {
+        let repo_binary = repo_root().join("target").join("debug").join(format!(
+            "stui-playground-black-box{}",
+            env::consts::EXE_SUFFIX
+        ));
+        let current_exe = PathBuf::from(format!(
+            r"C:\Users\Nexu\.cargo\bin\stui-dev{}",
+            env::consts::EXE_SUFFIX
+        ));
+        let sibling_binary = PathBuf::from(format!(
+            r"C:\Users\Nexu\.cargo\bin\stui-playground-black-box{}",
+            env::consts::EXE_SUFFIX
+        ));
+
+        let candidates = choose_candidate(&repo_binary, Some(&current_exe), None, None);
+
+        assert_eq!(candidates.first(), Some(&sibling_binary));
+        assert_eq!(candidates.last(), Some(&repo_binary));
+    }
+
+    #[test]
+    fn explicit_override_has_highest_priority() {
+        let repo_binary = repo_root().join("target").join("debug").join(format!(
+            "stui-playground-black-box{}",
+            env::consts::EXE_SUFFIX
+        ));
+        let current_exe = repo_root()
+            .join("target")
+            .join("debug")
+            .join(format!("stui-dev{}", env::consts::EXE_SUFFIX));
+        let override_binary = PathBuf::from(format!(
+            r"D:\stui\stui-playground-black-box{}",
+            env::consts::EXE_SUFFIX
+        ));
+
+        let candidates = choose_candidate(
+            &repo_binary,
+            Some(&current_exe),
+            Some(&override_binary),
+            None,
+        );
+
+        assert_eq!(candidates.first(), Some(&override_binary));
     }
 }

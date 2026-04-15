@@ -75,8 +75,9 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Serve(args) => {
+            let namespace = namespace_prefix();
             let playground = playground_config(args.behavior, false, SnapshotFormatArg::Text);
-            playground.serve_ipc(namespace_prefix().as_deref(), &args.instance)
+            playground.serve_ipc(namespace.as_deref(), &args.instance)
         }
         Command::Request(args) => {
             let playground = BlackBoxPlayground::load(BlackBoxPlaygroundConfig::default());

@@ -1,8 +1,41 @@
 # AGENTS
 
+This file is the repository's documentation entrypoint and the single source of truth for active project guidance.
+
+- Do not maintain a parallel top-level `README.md` as a competing overview or instructions document.
+- If high-level project guidance, workflow policy, or operator-facing usage changes, update `AGENTS.md` first.
+- Treat other docs as supporting material only; they must not override or drift from `AGENTS.md`.
+
 This repository is being grown as a learning-oriented cross-platform UI/runtime experiment.
 
 Current scope is intentionally minimal.
+
+## Project stance
+
+- Priority order:
+  1. Architecture validation
+  2. Performance exploration
+  3. Usable prototype
+- Prefer clean architecture over compatibility.
+- Validate abstractions before investing in tooling or polish.
+- Keep implementations small enough to understand, rebuild, and replace.
+- Treat performance as an early structural concern, but not the first optimization target.
+- The project is allowed to break, restart, and replace its own ideas when a better abstraction appears.
+
+## Workspace structure
+
+- `lib/crates/*`: core modeling, reusable runtime pieces, and platform adapters
+- `playgrounds/*`: narrow proving-ground experiments used to validate ideas quickly
+- `scripts/*`: Rust-based development and operational tooling
+
+Current intended roles:
+
+- `lib/crates/stui-core`: modeling + ports only
+- `lib/crates/stui-runtime`: concrete runtime declarations for current experiments
+- `lib/crates/stui-platform-desktop`: desktop host/present adaptation layer
+- `playgrounds/black-box`: smallest host/surface proving cell
+- `scripts/stui-dev`: supervisor-oriented development control surface
+- `scripts/stui-pack`: packaging-oriented script crate
 
 ## Long-term product vision
 
@@ -35,3 +68,23 @@ This vision is expected to evolve. The user may append or refine it over time, a
 - New capabilities should be introduced with inspect/debug affordances in mind. As a default, provide a debuggable path for state inspection and event triggering; special exceptions can be discussed case by case.
 - Prefer an optional IPC-based, namespace-isolated event interface for debug/control surfaces so that capabilities are observable and triggerable from outside the immediate UI loop.
 - Before considering a capability delivery complete, run a lowest-cost smoke gate yourself: build/check, minimal launch path, key interaction/event path, and the new UI/debug landing. Heavy end-to-end gates are optional and will be added by the user as needed.
+
+## `stui-dev` operations handbook
+
+- Treat `stui-dev` as the main command-boundary development control surface.
+- Keep `stui-dev` supervisor-oriented and out of direct playground/lib internals.
+
+### Command usage policy
+
+- Development and debugging flows should use `cargo run -p ...` directly.
+- Formal tool usage should prefer `cargo install --path ...` once, followed by the installed command directly.
+- Concretely:
+  - development/debug: `cargo run -p stui-dev -- ...`
+  - installed/operational use: `cargo install --path scripts/stui-dev`, then `stui-dev ...`
+
+### Operational expectations
+
+- Do not treat ad hoc `target/debug/*.exe` invocation as the primary workflow; use it only as a temporary troubleshooting path when necessary.
+- When discussing or validating behavior, be explicit about whether the path under test is the dev path (`cargo run -p`) or the installed path (`cargo install` + command).
+- `stui-dev` should resolve playground binaries in a way that respects that split: dev usage may target repo `target/debug`, while installed usage should prefer installed/explicitly configured binaries over a hardcoded repo-local path.
+- Keep smoke gates cheap but real: build/check, minimal launch, key control/inspect path, and visible/debug landing.

@@ -193,6 +193,32 @@ fn rgb24_hex_string(color: Rgb24) -> String {
 
 impl BlackBoxDebugSnapshot {
     pub fn to_json(&self) -> String {
+        let present_intent = match self.present.intent {
+            stui_core::RenderIntent::ClearSolid { color } => format!(
+                "{{\"kind\":\"clear_solid\",\"color\":{{\"red\":{},\"green\":{},\"blue\":{},\"hex\":\"{}\"}}}}",
+                color.red,
+                color.green,
+                color.blue,
+                rgb24_hex_string(color),
+            ),
+            stui_core::RenderIntent::ClearInset {
+                background,
+                inset,
+                margin,
+            } => format!(
+                "{{\"kind\":\"clear_inset\",\"background\":{{\"red\":{},\"green\":{},\"blue\":{},\"hex\":\"{}\"}},\"inset\":{{\"red\":{},\"green\":{},\"blue\":{},\"hex\":\"{}\"}},\"margin\":{}}}",
+                background.red,
+                background.green,
+                background.blue,
+                rgb24_hex_string(background),
+                inset.red,
+                inset.green,
+                inset.blue,
+                rgb24_hex_string(inset),
+                margin,
+            ),
+        };
+
         format!(
             concat!(
                 "{{",
@@ -209,12 +235,7 @@ impl BlackBoxDebugSnapshot {
                 "}}",
                 ",\"present\":{{",
                 "\"layer\":\"{}\"",
-                ",\"intent\":{{",
-                "\"kind\":\"clear_inset\"",
-                ",\"background\":{{\"red\":{},\"green\":{},\"blue\":{},\"hex\":\"{}\"}}",
-                ",\"inset\":{{\"red\":{},\"green\":{},\"blue\":{},\"hex\":\"{}\"}}",
-                ",\"margin\":{}",
-                "}}",
+                ",\"intent\":{}",
                 "}}",
                 ",\"presented_at_least_once\":{}",
                 "}}"
@@ -236,15 +257,7 @@ impl BlackBoxDebugSnapshot {
             rgb24_hex_string(self.root.fill.color),
             layer_role_as_str(self.root.fill.layer),
             layer_role_as_str(self.present.layer),
-            self.root.frame_color.red,
-            self.root.frame_color.green,
-            self.root.frame_color.blue,
-            rgb24_hex_string(self.root.frame_color),
-            self.root.fill.color.red,
-            self.root.fill.color.green,
-            self.root.fill.color.blue,
-            rgb24_hex_string(self.root.fill.color),
-            self.root.margin,
+            present_intent,
             self.presented_at_least_once,
         )
     }
@@ -337,12 +350,7 @@ impl FillComponentState {
 
 impl ResolvedBlackBoxTree {
     pub fn present_model(&self) -> PresentModel {
-        PresentModel::clear_inset_in_layer(
-            self.root.fill.layer,
-            self.root.frame_color,
-            self.root.fill.color,
-            self.root.margin,
-        )
+        PresentModel::clear_solid_in_layer(self.root.fill.layer, self.root.fill.color)
     }
 }
 

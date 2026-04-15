@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::io::Write;
 use std::{thread, time::Duration};
 use stui_ipc::{
     error_response, ok_response, request as ipc_request, ChannelNamespace, EventQueueDropPolicy,
@@ -124,6 +125,12 @@ impl BlackBoxPlayground {
         let namespace = namespace_for(namespace_prefix);
         let control_server = LocalIpcServer::bind(ipc_control_channel(&namespace, instance))?;
         let events_server = LocalIpcServer::bind(ipc_events_channel(&namespace, instance))?;
+        println!(
+            "status=ready playground=black-box instance={} {}",
+            instance,
+            self.ipc_server_summary(namespace_prefix, instance)
+        );
+        std::io::stdout().flush()?;
         control_server.set_nonblocking(true)?;
         events_server.set_nonblocking(true)?;
         let mut runtime = BlackBoxRuntime::new();
