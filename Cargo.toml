@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "lib/crates/*",
+    "playgrounds/*",
+    "scripts/*",
+]
+
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.39", features = ["derive"] }
