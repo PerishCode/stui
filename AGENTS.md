@@ -17,6 +17,7 @@ Current scope is intentionally minimal.
   2. Performance exploration
   3. Usable prototype
 - Prefer clean architecture over compatibility.
+- Do not preserve legacy paths, compatibility shims, or backward-compatibility wording unless the user explicitly asks for them.
 - Validate abstractions before investing in tooling or polish.
 - Keep implementations small enough to understand, rebuild, and replace.
 - Treat performance as an early structural concern, but not the first optimization target.

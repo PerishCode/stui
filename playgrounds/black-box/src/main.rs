@@ -23,6 +23,10 @@ enum Command {
 struct ServeArgs {
     #[arg(long, default_value = "default")]
     instance: String,
+    #[arg(long, default_value = "default")]
+    namespace_prefix: String,
+    #[arg(long)]
+    log_path: Option<String>,
     #[arg(long, value_enum)]
     behavior: Option<BehaviorArg>,
 }
@@ -31,6 +35,8 @@ struct ServeArgs {
 struct RequestArgs {
     #[arg(long, default_value = "default")]
     instance: String,
+    #[arg(long, default_value = "default")]
+    namespace_prefix: String,
     #[arg(long, value_enum, default_value_t = SurfaceArg::Control)]
     surface: SurfaceArg,
     request: String,
@@ -75,20 +81,19 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Serve(args) => {
-            let namespace = namespace_prefix();
             let playground = playground_config(args.behavior, false, SnapshotFormatArg::Text);
-            playground.serve_ipc(namespace.as_deref(), &args.instance)
+            playground.serve_ipc(Some(&args.namespace_prefix), &args.instance)
         }
         Command::Request(args) => {
             let playground = BlackBoxPlayground::load(BlackBoxPlaygroundConfig::default());
             let response = match args.surface {
                 SurfaceArg::Control => playground.send_ipc_request(
-                    namespace_prefix().as_deref(),
+                    Some(&args.namespace_prefix),
                     &args.instance,
                     &args.request,
                 )?,
                 SurfaceArg::Events => playground.send_ipc_event_request(
-                    namespace_prefix().as_deref(),
+                    Some(&args.namespace_prefix),
                     &args.instance,
                     &args.request,
                 )?,
@@ -135,19 +140,4 @@ fn map_behavior(behavior: BehaviorArg) -> BlackBoxDebugBehavior {
         BehaviorArg::Idle => BlackBoxDebugBehavior::Idle,
         BehaviorArg::Closing => BlackBoxDebugBehavior::Closing,
     }
-}
-
-fn namespace_prefix() -> Option<String> {
-    let prefix = std::env::var("STUI_DEV_IPC_NAMESPACE_PREFIX")
-        .ok()
-        .or_else(|| std::env::var("STUI_IPC_CHANNEL_PREFIX").ok());
-
-    prefix.and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
 }

@@ -1,7 +1,7 @@
 use std::{
     env,
     fs::{self, File},
-    io::ErrorKind,
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     thread,
@@ -19,6 +19,8 @@ const STOP_TIMEOUT_MS: u64 = 5_000;
 const POLL_INTERVAL_MS: u64 = 100;
 const START_ATTEMPTS: usize = 2;
 const READY_MARKER_PREFIX: &str = "status=ready playground=";
+const STATE_STALE_GRACE_MS: u128 = 2_000;
+const PROCESS_DISCOVERY_TIMEOUT_MS: u64 = 2_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "stui-dev")]
@@ -35,8 +37,7 @@ enum Action {
     Start(StartArgs),
     Stop(TargetArgs),
     Restart(StartArgs),
-    Status(TargetArgs),
-    StatusAll,
+    State(StateArgs),
     Inspect(TargetArgs),
     Events(TargetArgs),
     Logs(TargetArgs),
@@ -60,6 +61,13 @@ struct StartArgs {
     build: bool,
     #[arg(long, value_enum)]
     behavior: Option<BehaviorArg>,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct StateArgs {
+    playground: Option<PlaygroundName>,
+    #[arg(long, default_value = "default")]
+    instance: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -86,6 +94,17 @@ struct StateRecord {
     binary_path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+struct ObservedTarget {
+    playground: PlaygroundName,
+    instance: String,
+    namespace_prefix: String,
+    log_path: PathBuf,
+    pid: u32,
+    started_at_ms: u128,
+    binary_path: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeStatus {
     Running,
@@ -105,8 +124,18 @@ struct TimedOutput {
     timed_out: bool,
 }
 
+#[derive(Debug)]
+struct NamespaceOpGuard {
+    path: PathBuf,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let _namespace_guard = if cli.command.requires_namespace_lock() {
+        Some(acquire_namespace_op_lock(cli.command.as_str())?)
+    } else {
+        None
+    };
 
     match cli.command {
         Action::Targets => targets_action(),
@@ -121,11 +150,76 @@ fn main() -> Result<()> {
             })?;
             start_target(args)
         }
-        Action::Status(args) => status_target(args),
-        Action::StatusAll => status_all_action(),
+        Action::State(args) => state_action(args),
         Action::Inspect(args) => inspect_target(args),
         Action::Events(args) => events_target(args),
         Action::Logs(args) => logs_target(args),
+    }
+}
+
+fn acquire_namespace_op_lock(command_name: &str) -> Result<NamespaceOpGuard> {
+    ensure_runtime_dirs()?;
+    fs::create_dir_all(lock_dir()).context("create stui-dev lock dir")?;
+
+    let namespace = dev_namespace_prefix();
+    let path = lock_path(&namespace);
+
+    match write_lock_file(&path, command_name) {
+        Ok(()) => Ok(NamespaceOpGuard { path }),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            if clear_stale_namespace_lock(&path)? {
+                write_lock_file(&path, command_name)
+                    .with_context(|| format!("acquire namespace lock {}", path.display()))?;
+                Ok(NamespaceOpGuard { path })
+            } else {
+                bail!(
+                    "namespace busy: {} command={} lock={}",
+                    namespace,
+                    command_name,
+                    path.display()
+                );
+            }
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("acquire namespace lock {}", path.display()))
+        }
+    }
+}
+
+fn write_lock_file(path: &Path, command_name: &str) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)?;
+    writeln!(file, "pid={}", std::process::id())?;
+    writeln!(file, "command={}", command_name)?;
+    Ok(())
+}
+
+fn clear_stale_namespace_lock(path: &Path) -> Result<bool> {
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read lock file {}", path.display()))
+        }
+    };
+
+    let pid = source
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|value| value.parse::<u32>().ok());
+
+    if let Some(pid) = pid {
+        if process_exists(pid).unwrap_or(false) {
+            return Ok(false);
+        }
+    }
+
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error).with_context(|| format!("remove stale lock {}", path.display())),
     }
 }
 
@@ -138,49 +232,26 @@ fn targets_action() -> Result<()> {
 }
 
 fn prune_action() -> Result<()> {
-    let states = read_all_states()?;
-    if states.is_empty() {
-        println!("status=empty removed=0");
-        return Ok(());
-    }
-
-    let mut removed = 0usize;
-    let mut kept = 0usize;
-
-    for state in states {
-        let fact = classify_status(Some(&state));
-        if fact.status == RuntimeStatus::Stale {
-            cleanup_stale_state(&state)?;
-            removed += 1;
-            println!(
-                "status=pruned playground={} instance={} session={} stale_reason={}",
-                state.playground.as_str(),
-                state.instance,
-                state.session_id,
-                fact.stale_reason.unwrap_or("unknown")
-            );
-        } else {
-            kept += 1;
-        }
-    }
-
-    println!("status=complete removed={} kept={}", removed, kept);
+    let removed_logs = prune_logs()?;
+    let removed_locks = prune_locks()?;
+    let removed_state_dirs = prune_state_dirs()?;
+    println!(
+        "status=complete removed_logs={} removed_locks={} removed_state_dirs={}",
+        removed_logs, removed_locks, removed_state_dirs
+    );
     Ok(())
 }
 
 fn start_target(args: StartArgs) -> Result<()> {
     let namespace_prefix = dev_namespace_prefix();
 
-    if let Some(existing) = read_state(args.playground, &args.instance)? {
-        if request_inspect(&existing).is_ok() {
-            bail!(
-                "{} {} is already running",
-                args.playground.as_str(),
-                args.instance
-            );
-        }
-
-        cleanup_stale_state(&existing)?;
+    if find_target(args.playground, &args.instance, &namespace_prefix)?.is_some() {
+        bail!(
+            "{} {} is already running in namespace {}",
+            args.playground.as_str(),
+            args.instance,
+            namespace_prefix
+        );
     }
 
     ensure_runtime_dirs()?;
@@ -201,7 +272,10 @@ fn start_target(args: StartArgs) -> Result<()> {
 
     for attempt in 1..=START_ATTEMPTS {
         let session_id = create_session_id();
-        let log_path = log_path(args.playground, &args.instance, &session_id);
+        let log_path = log_path(&namespace_prefix, args.playground, &session_id);
+        if let Some(parent) = log_path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
         let log_file = File::create(&log_path).context("create dev log file")?;
         let stderr_file = log_file.try_clone().context("clone dev log file handle")?;
 
@@ -210,14 +284,14 @@ fn start_target(args: StartArgs) -> Result<()> {
             .arg("serve")
             .arg("--instance")
             .arg(&args.instance)
+            .arg("--namespace-prefix")
+            .arg(&namespace_prefix)
+            .arg("--log-path")
+            .arg(log_path.as_os_str())
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(stderr_file))
             .stdin(Stdio::null())
             .current_dir(repo_root());
-
-        if let Some(prefix) = namespace_prefix.as_deref() {
-            command.env(STUI_DEV_IPC_NAMESPACE_PREFIX_ENV, prefix);
-        }
 
         if let Some(behavior) = args.behavior {
             command.arg("--behavior").arg(behavior.as_str());
@@ -236,15 +310,13 @@ fn start_target(args: StartArgs) -> Result<()> {
         let state = StateRecord {
             playground: args.playground,
             instance: args.instance.clone(),
-            namespace_prefix: namespace_prefix.clone(),
+            namespace_prefix: Some(namespace_prefix.clone()),
             log_path,
             session_id,
             pid: child.id(),
             started_at_ms: now_ms(),
             binary_path: binary_path.clone(),
         };
-
-        write_state(&state)?;
 
         match wait_for_readiness(&state) {
             Ok(()) => {
@@ -261,7 +333,6 @@ fn start_target(args: StartArgs) -> Result<()> {
                     error
                 );
                 let _ = force_kill_pid(state.pid);
-                let _ = remove_state_file(state.playground, &state.instance);
                 last_error = Some(error);
             }
         }
@@ -292,7 +363,8 @@ fn start_target(args: StartArgs) -> Result<()> {
 }
 
 fn stop_target(args: TargetArgs) -> Result<()> {
-    let Some(state) = read_state(args.playground, &args.instance)? else {
+    let namespace_prefix = dev_namespace_prefix();
+    let Some(state) = find_target(args.playground, &args.instance, &namespace_prefix)? else {
         println!(
             "status=stopped playground={} instance={}",
             args.playground.as_str(),
@@ -308,8 +380,6 @@ fn stop_target(args: TargetArgs) -> Result<()> {
         force_kill_pid(state.pid).context("force kill stale playground process")?;
     }
 
-    remove_state_file(args.playground, &args.instance)?;
-
     match response {
         Ok(output) => println!("{output}"),
         Err(error) if graceful => println!("status=stopped detail={error}"),
@@ -319,8 +389,16 @@ fn stop_target(args: TargetArgs) -> Result<()> {
     Ok(())
 }
 
-fn status_target(args: TargetArgs) -> Result<()> {
-    let state = read_state(args.playground, &args.instance)?;
+fn state_action(args: StateArgs) -> Result<()> {
+    match args.playground {
+        Some(playground) => state_target(playground, &args.instance),
+        None => state_all_action(),
+    }
+}
+
+fn state_target(playground: PlaygroundName, instance: &str) -> Result<()> {
+    let namespace_prefix = dev_namespace_prefix();
+    let state = find_target(playground, instance, &namespace_prefix)?;
     let fact = classify_status(state.as_ref());
 
     match state {
@@ -330,7 +408,7 @@ fn status_target(args: TargetArgs) -> Result<()> {
             state.playground.as_str(),
             state.instance,
             state.session_id,
-            state.namespace_prefix.as_deref().unwrap_or("<default>"),
+            state.namespace_prefix.as_deref().unwrap_or("default"),
             state.pid,
             state.started_at_ms,
             state.log_path.display(),
@@ -341,16 +419,17 @@ fn status_target(args: TargetArgs) -> Result<()> {
         ),
         None => println!(
             "status=stopped playground={} instance={}",
-            args.playground.as_str(),
-            args.instance
+            playground.as_str(),
+            instance
         ),
     }
 
     Ok(())
 }
 
-fn status_all_action() -> Result<()> {
-    let states = read_all_states()?;
+fn state_all_action() -> Result<()> {
+    let namespace_prefix = dev_namespace_prefix();
+    let states = find_all_targets(&namespace_prefix)?;
 
     if states.is_empty() {
         println!("status=empty");
@@ -395,19 +474,19 @@ fn status_all_action() -> Result<()> {
 }
 
 fn inspect_target(args: TargetArgs) -> Result<()> {
-    let state = require_state(args.playground, &args.instance)?;
+    let state = require_target(args.playground, &args.instance, &dev_namespace_prefix())?;
     println!("{}", request_inspect(&state)?);
     Ok(())
 }
 
 fn events_target(args: TargetArgs) -> Result<()> {
-    let state = require_state(args.playground, &args.instance)?;
+    let state = require_target(args.playground, &args.instance, &dev_namespace_prefix())?;
     println!("{}", request_events(&state, "poll")?);
     Ok(())
 }
 
 fn logs_target(args: TargetArgs) -> Result<()> {
-    let state = require_state(args.playground, &args.instance)?;
+    let state = require_target(args.playground, &args.instance, &dev_namespace_prefix())?;
     let contents = fs::read_to_string(&state.log_path)
         .with_context(|| format!("read log file {}", state.log_path.display()))?;
     let lines = tail_lines(&contents, args.lines);
@@ -507,7 +586,7 @@ fn wait_for_shutdown(state: &StateRecord) -> Result<()> {
     let deadline = Instant::now() + Duration::from_millis(STOP_TIMEOUT_MS);
 
     loop {
-        if request_inspect(state).is_err() {
+        if !process_exists(state.pid)? {
             return Ok(());
         }
 
@@ -550,11 +629,11 @@ fn request_events(state: &StateRecord, request: &str) -> Result<String> {
 
 fn request_playground(state: &StateRecord, args: &[&str]) -> Result<String> {
     let mut command = Command::new(&state.binary_path);
-    command.args(args).current_dir(repo_root());
-
-    if let Some(prefix) = state.namespace_prefix.as_deref() {
-        command.env(STUI_DEV_IPC_NAMESPACE_PREFIX_ENV, prefix);
-    }
+    command
+        .args(args)
+        .arg("--namespace-prefix")
+        .arg(state.namespace_prefix.as_deref().unwrap_or("default"))
+        .current_dir(repo_root());
 
     let result = run_command_with_timeout(command, Duration::from_millis(REQUEST_TIMEOUT_MS))
         .context("run playground request command")?;
@@ -624,7 +703,16 @@ fn classify_status(state: Option<&StateRecord>) -> StatusFact {
             stale_reason: None,
         },
         Some(state) => {
-            if request_inspect(state).is_ok() {
+            if process_exists(state.pid).unwrap_or(false)
+                && log_reports_ready(state).unwrap_or(false)
+            {
+                StatusFact {
+                    status: RuntimeStatus::Running,
+                    stale_reason: None,
+                }
+            } else if process_exists(state.pid).unwrap_or(false)
+                && now_ms().saturating_sub(state.started_at_ms) <= STATE_STALE_GRACE_MS
+            {
                 StatusFact {
                     status: RuntimeStatus::Running,
                     stale_reason: None,
@@ -690,172 +778,22 @@ fn process_exists(pid: u32) -> Result<bool> {
     }
 }
 
-fn cleanup_stale_state(state: &StateRecord) -> Result<()> {
-    let _ = force_kill_pid(state.pid);
-    remove_state_file(state.playground, &state.instance)
-}
-
-fn read_state(playground: PlaygroundName, instance: &str) -> Result<Option<StateRecord>> {
-    let path = state_path(playground, instance);
-    let source = match fs::read_to_string(&path) {
-        Ok(source) => source,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("read state {}", path.display())),
-    };
-    let Some(record) = parse_state_source(&source)? else {
-        return Ok(None);
-    };
-
-    if record.playground != playground || record.instance != instance {
-        return Ok(None);
-    }
-
-    Ok(Some(record))
-}
-
-fn require_state(playground: PlaygroundName, instance: &str) -> Result<StateRecord> {
-    read_state(playground, instance)?.ok_or_else(|| {
+fn require_target(
+    playground: PlaygroundName,
+    instance: &str,
+    namespace_prefix: &str,
+) -> Result<StateRecord> {
+    find_target(playground, instance, namespace_prefix)?.ok_or_else(|| {
         anyhow!(
-            "no recorded {} instance named {}; start it first",
+            "no running {} instance named {} in namespace {}; start it first",
             playground.as_str(),
-            instance
+            instance,
+            namespace_prefix,
         )
     })
 }
 
-fn read_all_states() -> Result<Vec<StateRecord>> {
-    let dir = state_dir();
-    let entries = match fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("read state dir {}", dir.display()))
-        }
-    };
-
-    let mut states = Vec::new();
-    for entry in entries {
-        let entry = entry.context("read state dir entry")?;
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("state") {
-            continue;
-        }
-
-        let source =
-            fs::read_to_string(&path).with_context(|| format!("read state {}", path.display()))?;
-        if let Some(state) = parse_state_source(&source)? {
-            states.push(state);
-        }
-    }
-
-    states.sort_by(|a, b| {
-        a.playground
-            .as_str()
-            .cmp(b.playground.as_str())
-            .then(a.instance.cmp(&b.instance))
-    });
-    Ok(states)
-}
-
-fn write_state(state: &StateRecord) -> Result<()> {
-    let path = state_path(state.playground, &state.instance);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-
-    fs::write(
-        &path,
-        format!(
-            concat!(
-                "playground={}\n",
-                "instance={}\n",
-                "namespace_prefix={}\n",
-                "log_path={}\n",
-                "session_id={}\n",
-                "pid={}\n",
-                "started_at_ms={}\n",
-                "binary_path={}\n"
-            ),
-            state.playground.as_str(),
-            state.instance,
-            state.namespace_prefix.as_deref().unwrap_or(""),
-            state.log_path.display(),
-            state.session_id,
-            state.pid,
-            state.started_at_ms,
-            state.binary_path.display(),
-        ),
-    )
-    .with_context(|| format!("write state {}", path.display()))
-}
-
-fn parse_state_source(source: &str) -> Result<Option<StateRecord>> {
-    let mut playground = None;
-    let mut instance = None;
-    let mut namespace_prefix = None;
-    let mut log_path = PathBuf::new();
-    let mut session_id = String::new();
-    let mut pid = 0;
-    let mut started_at_ms = 0;
-    let mut binary_path = PathBuf::new();
-
-    for line in source.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-
-        match key {
-            "playground" => playground = Some(PlaygroundName::from_str(value)?),
-            "instance" => instance = Some(value.to_string()),
-            "namespace_prefix" => {
-                namespace_prefix = if value.is_empty() {
-                    None
-                } else {
-                    Some(value.to_string())
-                }
-            }
-            "log_path" => log_path = PathBuf::from(value),
-            "session_id" => session_id = value.to_string(),
-            "pid" => pid = value.parse().unwrap_or_default(),
-            "started_at_ms" => started_at_ms = value.parse().unwrap_or_default(),
-            "binary_path" => binary_path = PathBuf::from(value),
-            _ => {}
-        }
-    }
-
-    let Some(playground) = playground else {
-        return Ok(None);
-    };
-    let Some(instance) = instance else {
-        return Ok(None);
-    };
-    if binary_path.as_os_str().is_empty() {
-        binary_path = playground_binary_path(playground);
-    }
-
-    Ok(Some(StateRecord {
-        playground,
-        instance,
-        namespace_prefix,
-        log_path,
-        session_id,
-        pid,
-        started_at_ms,
-        binary_path,
-    }))
-}
-
-fn remove_state_file(playground: PlaygroundName, instance: &str) -> Result<()> {
-    let path = state_path(playground, instance);
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("remove state {}", path.display())),
-    }
-}
-
 fn ensure_runtime_dirs() -> Result<()> {
-    fs::create_dir_all(state_dir()).context("create stui-dev state dir")?;
     fs::create_dir_all(log_dir()).context("create stui-dev log dir")?;
     Ok(())
 }
@@ -951,29 +889,245 @@ fn dev_runtime_root() -> PathBuf {
     repo_root().join(".tmp").join("stui-dev")
 }
 
-fn state_dir() -> PathBuf {
-    dev_runtime_root().join("state")
-}
-
 fn log_dir() -> PathBuf {
     dev_runtime_root().join("logs")
 }
 
-fn state_path(playground: PlaygroundName, instance: &str) -> PathBuf {
-    state_dir().join(format!(
-        "{}--{}.state",
-        playground.as_str(),
-        sanitize(instance)
-    ))
+fn state_dir() -> PathBuf {
+    dev_runtime_root().join("state")
 }
 
-fn log_path(playground: PlaygroundName, instance: &str, session_id: &str) -> PathBuf {
-    log_dir().join(format!(
-        "{}--{}--{}.log",
-        playground.as_str(),
-        sanitize(instance),
-        session_id
-    ))
+fn lock_dir() -> PathBuf {
+    dev_runtime_root().join("locks")
+}
+
+fn lock_path(namespace: &str) -> PathBuf {
+    lock_dir().join(format!("{}.lock", sanitize(namespace)))
+}
+
+fn log_path(namespace_prefix: &str, playground: PlaygroundName, session_id: &str) -> PathBuf {
+    log_dir()
+        .join(sanitize(namespace_prefix))
+        .join(playground.binary_name())
+        .join(format!("{}.log", session_id))
+}
+
+fn find_target(
+    playground: PlaygroundName,
+    instance: &str,
+    namespace_prefix: &str,
+) -> Result<Option<StateRecord>> {
+    Ok(find_all_targets(namespace_prefix)?
+        .into_iter()
+        .find(|target| target.playground == playground && target.instance == instance))
+}
+
+fn find_all_targets(namespace_prefix: &str) -> Result<Vec<StateRecord>> {
+    let mut states = discover_targets(PlaygroundName::BlackBox)?
+        .into_iter()
+        .filter(|target| target.namespace_prefix == namespace_prefix)
+        .map(observed_to_state)
+        .collect::<Vec<_>>();
+
+    states.sort_by(|a, b| {
+        a.playground
+            .as_str()
+            .cmp(b.playground.as_str())
+            .then(a.instance.cmp(&b.instance))
+    });
+    Ok(states)
+}
+
+fn observed_to_state(target: ObservedTarget) -> StateRecord {
+    StateRecord {
+        playground: target.playground,
+        instance: target.instance,
+        namespace_prefix: Some(target.namespace_prefix),
+        log_path: target.log_path,
+        session_id: target.started_at_ms.to_string(),
+        pid: target.pid,
+        started_at_ms: target.started_at_ms,
+        binary_path: target.binary_path,
+    }
+}
+
+fn discover_targets(playground: PlaygroundName) -> Result<Vec<ObservedTarget>> {
+    #[cfg(target_os = "windows")]
+    {
+        discover_targets_windows(playground)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = playground;
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn discover_targets_windows(playground: PlaygroundName) -> Result<Vec<ObservedTarget>> {
+    let script = format!(
+        "$ErrorActionPreference='Stop'; Get-CimInstance Win32_Process -Filter \"Name = '{}'\" | ForEach-Object {{ [Console]::WriteLine('{{0}}\t{{1}}', $_.ProcessId, $_.CommandLine) }}",
+        playground.binary_name_with_suffix(),
+    );
+    let result = run_command_with_timeout(
+        {
+            let mut command = Command::new("powershell");
+            command.args(["-NoProfile", "-Command", &script]);
+            command
+        },
+        Duration::from_millis(PROCESS_DISCOVERY_TIMEOUT_MS),
+    )?;
+
+    if result.timed_out {
+        bail!(
+            "process discovery timed out after {}ms",
+            PROCESS_DISCOVERY_TIMEOUT_MS
+        );
+    }
+
+    if !result.output.status.success() {
+        bail!(
+            "process discovery failed: {}",
+            String::from_utf8_lossy(&result.output.stderr).trim()
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&result.output.stdout);
+    let mut targets = Vec::new();
+
+    for line in stdout.lines() {
+        let Some((pid_text, command_line)) = line.split_once('\t') else {
+            continue;
+        };
+        let Ok(pid) = pid_text.trim().parse::<u32>() else {
+            continue;
+        };
+        let Some(observed) = parse_observed_target(playground, pid, command_line) else {
+            continue;
+        };
+        targets.push(observed);
+    }
+
+    Ok(targets)
+}
+
+fn parse_observed_target(
+    playground: PlaygroundName,
+    pid: u32,
+    command_line: &str,
+) -> Option<ObservedTarget> {
+    let tokens = split_command_line(command_line);
+    if !tokens
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("serve"))
+    {
+        return None;
+    }
+
+    let instance = command_arg_value(&tokens, "--instance")?;
+    let namespace_prefix = command_arg_value(&tokens, "--namespace-prefix")?;
+    let log_path = PathBuf::from(command_arg_value(&tokens, "--log-path")?);
+    let session_id = log_path.file_stem()?.to_string_lossy().to_string();
+    let started_at_ms = session_id.parse::<u128>().ok()?;
+    let binary_path = tokens.first().map(PathBuf::from)?;
+
+    Some(ObservedTarget {
+        playground,
+        instance,
+        namespace_prefix,
+        log_path,
+        pid,
+        started_at_ms,
+        binary_path,
+    })
+}
+
+fn split_command_line(command_line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in command_line.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            other => current.push(other),
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn command_arg_value(tokens: &[String], flag: &str) -> Option<String> {
+    tokens
+        .windows(2)
+        .find(|window| window[0] == flag)
+        .map(|window| window[1].clone())
+}
+
+fn prune_logs() -> Result<usize> {
+    let entries = match fs::read_dir(log_dir()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read log dir {}", log_dir().display()))
+        }
+    };
+
+    let mut removed = 0usize;
+    for entry in entries {
+        let entry = entry.context("read log dir entry")?;
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("log") {
+            fs::remove_file(&path).with_context(|| format!("remove log {}", path.display()))?;
+            removed += 1;
+        }
+    }
+
+    Ok(removed)
+}
+
+fn prune_locks() -> Result<usize> {
+    let entries = match fs::read_dir(lock_dir()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read lock dir {}", lock_dir().display()))
+        }
+    };
+
+    let mut removed = 0usize;
+    for entry in entries {
+        let entry = entry.context("read lock dir entry")?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("lock") {
+            continue;
+        }
+
+        if clear_stale_namespace_lock(&path)? {
+            removed += 1;
+        }
+    }
+
+    Ok(removed)
+}
+
+fn prune_state_dirs() -> Result<usize> {
+    let path = state_dir();
+    match fs::remove_dir_all(&path) {
+        Ok(()) => Ok(1),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error).with_context(|| format!("remove state dir {}", path.display())),
+    }
 }
 
 fn sanitize(value: &str) -> String {
@@ -1000,11 +1154,12 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
-fn dev_namespace_prefix() -> Option<String> {
+fn dev_namespace_prefix() -> String {
     env::var(STUI_DEV_IPC_NAMESPACE_PREFIX_ENV)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "default".to_string())
 }
 
 fn force_kill_pid(pid: u32) -> Result<()> {
@@ -1064,16 +1219,33 @@ impl PlaygroundName {
         }
     }
 
+    fn binary_name_with_suffix(self) -> String {
+        format!("{}{}", self.binary_name(), env::consts::EXE_SUFFIX)
+    }
+
     fn binary_override_env(self) -> &'static str {
         match self {
             Self::BlackBox => "STUI_DEV_BLACK_BOX_BIN",
         }
     }
+}
 
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "black-box" => Ok(Self::BlackBox),
-            other => bail!("unsupported playground in state: {other}"),
+impl Action {
+    fn requires_namespace_lock(&self) -> bool {
+        !matches!(self, Self::Targets)
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Targets => "targets",
+            Self::Prune => "prune",
+            Self::Start(_) => "start",
+            Self::Stop(_) => "stop",
+            Self::Restart(_) => "restart",
+            Self::State(_) => "state",
+            Self::Inspect(_) => "inspect",
+            Self::Events(_) => "events",
+            Self::Logs(_) => "logs",
         }
     }
 }
@@ -1095,6 +1267,12 @@ impl RuntimeStatus {
             Self::Stopped => "stopped",
             Self::Stale => "stale",
         }
+    }
+}
+
+impl Drop for NamespaceOpGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 
