@@ -27,7 +27,7 @@ Current scope is intentionally minimal.
 
 - `lib/crates/*`: core modeling, reusable runtime pieces, and platform adapters
 - `playgrounds/*`: narrow proving-ground experiments used to validate ideas quickly
-- `scripts/*`: Rust-based development and operational tooling
+- `tools/*`: Rust-based development and operational tooling
 
 Current intended roles:
 
@@ -35,8 +35,8 @@ Current intended roles:
 - `lib/crates/stui-runtime`: concrete runtime declarations for current experiments
 - `lib/crates/stui-platform-desktop`: desktop host/present adaptation layer
 - `playgrounds/black-box`: smallest host/surface proving cell
-- `scripts/stui-dev`: supervisor-oriented development control surface
-- `scripts/stui-pack`: packaging-oriented script crate
+- `tools/stui-dev`: supervisor-oriented development control surface
+- `tools/stui-pack`: packaging-oriented tool crate
 
 ## Long-term product vision
 
@@ -81,7 +81,7 @@ This vision is expected to evolve. The user may append or refine it over time, a
 - Formal tool usage should prefer `cargo install --path ...` once, followed by the installed command directly.
 - Concretely:
   - development/debug: `cargo run -p stui-dev -- ...`
-  - installed/operational use: `cargo install --path scripts/stui-dev`, then `stui-dev ...`
+  - installed/operational use: `cargo install --path tools/stui-dev`, then `stui-dev ...`
 
 ### Operational expectations
 

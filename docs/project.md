@@ -128,11 +128,11 @@ The repository is organized around three roles:
 - `playgrounds/*`
   - narrow Rust experiments
   - temporary proving grounds for rendering, lifecycle, and platform assumptions
-- `scripts/*`
+- `tools/*`
   - Rust-based development and operational tooling
   - launchers, packers, and other non-core executables
 
-This means script crates are not the architectural center. Core modeling belongs in `lib/crates`, while `playgrounds` exist to pressure-test ideas without turning every experiment into framework surface area.
+This means tool crates are not the architectural center. Core modeling belongs in `lib/crates`, while `playgrounds` exist to pressure-test ideas without turning every experiment into framework surface area.
 
 ## Current architectural constraints
 
@@ -150,7 +150,7 @@ For now that means core owns concepts like `Host`, `Surface`, `Event`, and `Comp
 - decides which events and components exist in a given experiment
 - turns core slots into a runnable statement of intent
 
-### `scripts/*`
+### `tools/*`
 
 - use `AppState` for global singleton management
 - initialize `Config` separately and feed it downward
@@ -170,10 +170,10 @@ For now that means core owns concepts like `Host`, `Surface`, `Event`, and `Comp
   - temporary place for a window-backed host adapter without polluting core vocabulary
 - `playgrounds/black-box`
   - narrow experiment for the minimal black undecorated host surface
-- `scripts/stui-dev`
+- `tools/stui-dev`
   - developer-facing launcher built around `AppState` + `Config`
-- `scripts/stui-pack`
-  - reserved packaging script crate
+- `tools/stui-pack`
+  - reserved packaging tool crate
 
 ## Current milestone
 
@@ -188,7 +188,7 @@ This milestone is about bootstrap shape and lifecycle correctness, not about bui
 
 The first runnable path is now shaped as:
 
-- `scripts/stui-dev` launches the experiment
+- `tools/stui-dev` launches the experiment
 - `playgrounds/black-box` names the narrow experiment
 - `lib/crates/stui-platform-desktop` owns the desktop event loop and present path
 - `winit + softbuffer` stay contained in the desktop adapter layer

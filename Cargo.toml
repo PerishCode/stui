@@ -2,7 +2,7 @@
 members = [
     "lib/crates/*",
     "playgrounds/*",
-    "scripts/*",
+    "tools/*",
 ]
 
 resolver = "2"
